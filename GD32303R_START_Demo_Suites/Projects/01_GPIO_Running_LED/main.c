@@ -51,32 +51,39 @@ typedef struct {
 } Sbus_Channels_t;
 
 Sbus_Channels_t sbus_data;
-uint8_t sbus_rx_buf[25] = 0; // S.BUS固定25字节
+uint8_t sbus_rx_buf[25]; // S.BUS固定25字节
 uint8_t sbus_flag = 0;   // 帧完成标志
 
-void sbus_parse(uint8_t *buf) {
-    if (buf[0] != 0x0F || buf[24] != 0x00) return; // 检查帧头帧尾
+// 修改返回值为 uint8_t (1:成功, 0:失败)
+uint8_t sbus_parse(volatile uint8_t *buf) {
+    /* S.BUS 标准：帧头 0x0F, 帧尾 0x00 */
+    /* 某些接收器在高速模式下帧尾可能是 0x04, 0x14 等，通常 0x00 最通用 */
+    if (buf[0] != 0x0F) {
+        return 0; 
+    }
+    
+    // 如果你发现数据是对的但帧尾不对，可以临时把 buf[24] != 0x00 去掉调试
+    if (buf[24] != 0x00) {
+        // return 0; 
+    }
 
-    // S.BUS 协议位操作解析 (11-bit 每个通道)
-    sbus_data.ch[0]  = ((buf[1]    | buf[2] << 8)                          & 0x07FF);
-    sbus_data.ch[1]  = ((buf[2] >> 3 | buf[3] << 5)                         & 0x07FF);
-    sbus_data.ch[2]  = ((buf[3] >> 6 | buf[4] << 2 | buf[5] << 10)          & 0x07FF);
-    sbus_data.ch[3]  = ((buf[5] >> 1 | buf[6] << 7)                         & 0x07FF);
-    sbus_data.ch[4]  = ((buf[6] >> 4 | buf[7] << 4)                         & 0x07FF);
-    sbus_data.ch[5]  = ((buf[7] >> 7 | buf[8] << 1 | buf[9] << 9)           & 0x07FF);
-    sbus_data.ch[6]  = ((buf[9] >> 2 | buf[10] << 6)                        & 0x07FF);
-    sbus_data.ch[7]  = ((buf[10] >> 5 | buf[11] << 3)                       & 0x07FF);
-    sbus_data.ch[8]  = ((buf[12]   | buf[13] << 8)                         & 0x07FF);
-    sbus_data.ch[9]  = ((buf[13] >> 3 | buf[14] << 5)                        & 0x07FF);
-	
-	// 解析第 24 字节 (buf[23])
-    // Bit 3: Failsafe 激活标志
-    // Bit 2: 帧丢失 (Frame Lost) 标志
-    if (buf[23] & (1 << 3)) {
-        sbus_data.failsafe = 1; // 遥控器没开或断连
-    } else {
-        sbus_data.failsafe = 0; // 信号正常
-}
+    // 解析 11-bit 通道 (1-10通道)
+    sbus_data.ch[0] = ((buf[1]       | buf[2] << 8) & 0x07FF);
+    sbus_data.ch[1] = ((buf[2] >> 3  | buf[3] << 5) & 0x07FF);
+    sbus_data.ch[2] = ((buf[3] >> 6  | buf[4] << 2 | buf[5] << 10) & 0x07FF);
+    sbus_data.ch[3] = ((buf[5] >> 1  | buf[6] << 7) & 0x07FF);
+    sbus_data.ch[4] = ((buf[6] >> 4  | buf[7] << 4) & 0x07FF);
+    sbus_data.ch[5] = ((buf[7] >> 7  | buf[8] << 1 | buf[9] << 9) & 0x07FF);
+    sbus_data.ch[6] = ((buf[9] >> 2  | buf[10] << 6) & 0x07FF);
+    sbus_data.ch[7] = ((buf[10] >> 5 | buf[11] << 3) & 0x07FF);
+    sbus_data.ch[8] = ((buf[12]      | buf[13] << 8) & 0x07FF);
+    sbus_data.ch[9] = ((buf[13] >> 3 | buf[14] << 5) & 0x07FF);
+
+    // 解析第 24 字节：Failsafe 标志
+    // Bit 3: Failsafe active, Bit 2: Frame lost
+    sbus_data.failsafe = (buf[23] & 0x08) ? 1 : 0;
+
+    return 1;
 }
 /*
 PA9  --> USART0_TX
@@ -99,9 +106,6 @@ Channel_9:  C
 Channel_10: D
 */
 
-uint8_t rx_buffer[256];
-uint8_t rx_index;
-
 #define USART0_TX_PORT       GPIOB
 #define USART0_TX_PIN GPIO_PIN_6
 #define USART0_RX_PORT       GPIOB
@@ -113,7 +117,7 @@ uint8_t rx_index;
 #define UART3_RX_PIN GPIO_PIN_11
 #define UART3_TX_PIN GPIO_PIN_10
 
-
+uint8_t usart0_rx_dma[25];
 static void usart0_config(void)
 {
     rcu_periph_clock_enable(RCU_USART0_GPIO_PORT);
@@ -136,32 +140,88 @@ static void usart0_config(void)
     usart_receive_config(USART0, USART_RECEIVE_ENABLE);
     usart_transmit_config(USART0, USART_TRANSMIT_ENABLE);
 	
-    usart_enable(USART0);
+    usart_dma_receive_config(USART0, USART_RECEIVE_DMA_ENABLE);
+
 }
-static void usart3_config(void)
+
+void usart0_dma_config(void)
 {
-    rcu_periph_clock_enable(RCU_GPIOC);
+    dma_parameter_struct dma_init_struct;
+    
+    /* 开启 DMA0 时钟 (USART0 对应 DMA0 Channel 4) */
+    rcu_periph_clock_enable(RCU_DMA0);
 
-	rcu_periph_clock_enable(RCU_UART3);
-
-    gpio_init(GPIOC, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, UART3_TX_PIN);
-
-	gpio_init(GPIOC, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, UART3_RX_PIN);
-
-	usart_deinit(UART3);
-    usart_baudrate_set(UART3, 100000UL);
-	usart_parity_config(UART3, USART_PM_EVEN);
-	usart_stop_bit_set(UART3, USART_STB_2BIT);
-    usart_receive_config(UART3, USART_RECEIVE_ENABLE);
-    usart_transmit_config(UART3, USART_TRANSMIT_ENABLE);
+    /* 清除之前的配置 */
+    //dma_deinit(DMA0, DMA_CH4);
+	//usart_dma_receive_config(USART0, USART_RECEIVE_DMA_ENABLE);
+	usart_flag_clear(USART0, USART_FLAG_RBNE);
 	
-	/*串口中断配置*/
-	usart_interrupt_enable(UART3, USART_INT_RBNE);
+    dma_struct_para_init(&dma_init_struct);
+    dma_init_struct.periph_addr  = (uint32_t)&USART_DATA(USART0); // 串口数据寄存器地址
+    dma_init_struct.memory_addr  = (uint32_t)usart0_rx_dma;      // 内存目标地址
+    dma_init_struct.direction    = DMA_PERIPHERAL_TO_MEMORY;   // 外设到内存
+    dma_init_struct.number       = 25;                         // 传输长度
+    dma_init_struct.periph_inc   = DMA_PERIPH_INCREASE_DISABLE;
+    dma_init_struct.memory_inc   = DMA_MEMORY_INCREASE_ENABLE; // 内存地址自增
+    dma_init_struct.periph_width = DMA_PERIPHERAL_WIDTH_8BIT;
+    dma_init_struct.memory_width = DMA_MEMORY_WIDTH_8BIT;
+    dma_init_struct.priority     = DMA_PRIORITY_ULTRA_HIGH;
+    dma_init(DMA0, DMA_CH4, &dma_init_struct);
 	
-	nvic_irq_enable(UART3_IRQn, 0, 0);
-	
-    usart_enable(UART3);
+	dma_circulation_disable(DMA0, DMA_CH4); 
+	dma_channel_enable(DMA0, DMA_CH4);
 }
+
+
+static void usart3_config(void) {
+    rcu_periph_clock_enable(RCU_GPIOC);
+    rcu_periph_clock_enable(RCU_UART3);
+	
+    gpio_init(GPIOC, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, UART3_TX_PIN);
+    gpio_init(GPIOC, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, UART3_RX_PIN);
+
+    // 1. 先 Deinit
+    usart_deinit(UART3);
+    
+    // 2. 配置参数
+    usart_baudrate_set(UART3, 100000UL);
+    usart_parity_config(UART3, USART_PM_EVEN);
+    usart_stop_bit_set(UART3, USART_STB_2BIT);
+    usart_receive_config(UART3, USART_RECEIVE_ENABLE);
+    
+    // 3. 使能串口
+    //usart_enable(UART3);
+    
+    // 4. 【关键】在串口使能后，强行开启 DMA 接收请求和空闲中断
+    USART_CTL2(UART3) |= (uint32_t)0x40;  // 强制写 DENR 位
+    usart_interrupt_enable(UART3, USART_INT_IDLE);
+    nvic_irq_enable(UART3_IRQn, 0, 0);
+}
+
+/* 1. 定义一个缓冲区 */
+volatile uint8_t sbus_rx_dma[25];
+
+void usart3_dma_config(void) {
+    dma_parameter_struct dma_init_struct;
+    rcu_periph_clock_enable(RCU_DMA1);
+    dma_deinit(DMA1, DMA_CH2);
+    
+    dma_struct_para_init(&dma_init_struct);
+    dma_init_struct.periph_addr  = (uint32_t)&USART_DATA(UART3);
+    dma_init_struct.memory_addr  = (uint32_t)sbus_rx_dma;
+    dma_init_struct.direction    = DMA_PERIPHERAL_TO_MEMORY;
+    dma_init_struct.number       = 25;
+    dma_init_struct.periph_inc   = DMA_PERIPH_INCREASE_DISABLE;
+    dma_init_struct.memory_inc   = DMA_MEMORY_INCREASE_ENABLE;
+    dma_init_struct.periph_width = DMA_PERIPHERAL_WIDTH_8BIT;
+    dma_init_struct.memory_width = DMA_MEMORY_WIDTH_8BIT;
+    dma_init_struct.priority     = DMA_PRIORITY_ULTRA_HIGH;
+    dma_init(DMA1, DMA_CH2, &dma_init_struct);
+
+    dma_circulation_enable(DMA1, DMA_CH2);
+    dma_channel_enable(DMA1, DMA_CH2);
+}
+
 /*!
     \brief      main function
     \param[in]  none
@@ -172,46 +232,59 @@ static void usart3_config(void)
 int main(void)
 {	
     systick_config();
+	usart0_dma_config();
     usart0_config();
+	usart3_dma_config(); 
     usart3_config();
-    
+	
+	usart_enable(USART0);
+	usart_enable(UART3);
     printf("S.BUS Parser Start...\r\n");
 
-    while(1) {
-        if(sbus_flag) {
-            sbus_flag = 0;
-            sbus_parse(sbus_rx_buf);
-
-			if(sbus_data.failsafe == 0){
-            // 按照你的通道要求打印
-            printf("X2:%4d | Y2:%4d | Y1:%4d | X1:%4d | E:%4d | F:%4d | A:%4d | B:%4d | C:%4d | D:%4d\r\n",
-                   sbus_data.ch[0], sbus_data.ch[1], sbus_data.ch[2], sbus_data.ch[3],
-                   sbus_data.ch[4], sbus_data.ch[5], sbus_data.ch[6], sbus_data.ch[7],
-                   sbus_data.ch[8], sbus_data.ch[9]);
+	while(1) {
+			if(sbus_flag) {
+				sbus_flag = 0; // 抢占标志位
+				
+				if(sbus_parse(sbus_rx_dma)) {
+					if(sbus_data.failsafe) {
+						printf("[WARN] Failsafe Active!\r\n");
+					} else {
+						// 打印关键通道数据，%4d 保持排版整齐
+						printf("CH1:%4d CH2:%4d CH3:%4d CH4:%4d | S1:%4d S2:%4d\r\n",
+							   sbus_data.ch[0], sbus_data.ch[1], sbus_data.ch[2], 
+							   sbus_data.ch[3], sbus_data.ch[4], sbus_data.ch[5]);
+					}
+				} else {
+					// 此时通常是发生了相位偏移，中断里的重置逻辑会在下一帧修复它
+					 printf("Syncing...\r\n"); 
+				}
 			}
-			else
-				printf("No Sigal\r\n");
-        }
-        // S.BUS 周期通常是 7ms 或 14ms，这里不需要大的 delay
-    }
+			
+			// 如果需要低频打印状态，可以用 systick 计时，千万别用 delay_1ms
+		}
 }
 
-void UART3_IRQHandler(void)                  
-{
-    static uint8_t count = 0;
-    if(RESET != usart_interrupt_flag_get(UART3, USART_INT_FLAG_RBNE)){
-        uint8_t res = usart_data_receive(UART3);
+void UART3_IRQHandler(void) {
+    if (RESET != usart_interrupt_flag_get(UART3, USART_INT_FLAG_IDLE)) {
+        /* 1. 硬件要求：清除 IDLE 标志位的标准序列 */
+        usart_interrupt_flag_get(UART3, USART_INT_FLAG_IDLE);
+        (void)usart_data_receive(UART3); 
+
+        /* 2. 检查对齐：DMA 是向下计数的 */
+        uint32_t remaining = dma_transfer_number_get(DMA1, DMA_CH2);
         
-        // 简单的帧头对齐逻辑
-        if (count == 0 && res != 0x0F) {
-            return; 
-        }
-
-        sbus_rx_buf[count++] = res;
-
-        if (count == 25) {
-            count = 0;
-            sbus_flag = 1; // 标记一帧接收完成
+        /* 理想状态：一帧 25 字节正好收完，remaining 应该是 0 (然后自动重装为 25) 
+           或者刚开始收下一帧。如果偏离太远，说明对齐丢了 */
+        if (remaining != 25 && remaining != 0) {
+            /* 发现相位偏移：强制停掉 DMA，重置计数器到 25，重新开始 */
+            dma_channel_disable(DMA1, DMA_CH2);
+            dma_transfer_number_config(DMA1, DMA_CH2, 25);
+            dma_channel_enable(DMA1, DMA_CH2);
+            
+            sbus_flag = 0; // 丢弃当前这帧乱掉的数据
+        } else {
+            /* 状态正确，通知 Main 循环去解析 sbus_rx_dma[0..24] */
+            sbus_flag = 1; 
         }
     }
 }
