@@ -19,4 +19,5 @@
 - Channel_9:  C
 - Channel_10: D
 
-遥控器和接收器分别为云卓科技的 T10 和 R10
+# ATTENTION
+- 遥控器和接收器分别为SKYROID(云卓科技的) T10 和 R10
